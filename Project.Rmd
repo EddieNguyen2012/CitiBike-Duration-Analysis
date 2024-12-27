@@ -1,0 +1,673 @@
+---
+title: "Citi Bike Ride Duration Analysis"
+author: "Manh Tuong Nguyen"
+output:
+  word_document: default
+date: "2024-11-18"
+editor_options:
+  markdown:
+    wrap: 72
+    
+always_allow_html: yes
+---
+
+# Data importation
+
+I first read in the data file and drop all the rows that has N/A values
+since the data is very large. Also, for October 2024, the total data has
+6 parts so I only use a half of them for optimizing simplicity and
+performance.
+
+```{r, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(mapview)
+```
+
+```{r, include=FALSE}
+temp <- list.files(path='/Users/eddie/MATH167R/Data', pattern="\\.csv$", all.files=TRUE, full.names = TRUE) # Create a list of .csv files in the clarified path
+myfiles <- lapply(temp, read.csv) # Read all the files using csv and make a list to store all data.frames
+data <- do.call(rbind, myfiles) # Bind all the data.frames into one
+rm(myfiles) # Erase the list from memory to free space
+data <- drop_na(data = data) #Drop all rows with N/A values
+data <- subset(data, select =  -c(end_station_id, start_station_id, ride_id)) # Drop columns that contains IDs
+data <- data.frame(data) # Ensure the data is stored as data.frame
+data$started_at <- as.POSIXct(data$started_at, format = "%Y-%m-%d %H:%M:%S") # Reformat the data as POSIXct date
+data$ended_at <- as.POSIXct(data$ended_at, format = "%Y-%m-%d %H:%M:%S")
+data <- data[(data$started_at > as.POSIXct("2024-10-01 00:00:00")) & (data$started_at < as.POSIXct("2024-10-14 23:59:59")),] # Ensure the data has rides started from 0:00:00 Oct 10, 2024 to 23:59:59 Oct 14, 2024
+```
+
+# Exploratory Data Analysis
+
+## Shape and columns
+
+```{r}
+glimpse(data)
+```
+
+The cleaned data has 2340229 rows with 10 columns. The data type of all
+the columns are well-formatted.
+
+```{r}
+data$datetime_minute <- format(data$started_at, "%Y-%m-%d %H:%M") # Extract date-time up to minutes
+group_by(data, datetime_minute) |> 
+  summarise(count = n()) |> 
+  ggplot(aes(x=as.POSIXct(datetime_minute, format='%Y-%m-%d %H:%M'), y=count)) + 
+  geom_line(color='blue') + labs(title='Count by hour and minute', x='Timespan', y='Count') + 
+  theme_classic()
+```
+
+Here I will create the duration data by calculating the differences
+between started_at and ended_at
+
+```{r}
+data$duration <- round(as.numeric(difftime(data$ended_at, data$started_at, units='secs')))
+data$duration <- data$duration / 60
+```
+
+```{r}
+ggplot(data[data$duration < 60,], aes(x=duration, color=member_casual)) + geom_histogram(bins=60) + labs(title='Historgram of ride duration under 60 minutes', x='Duration (minutes)', y='Count') + theme_classic() 
+```
+
+Next, I will create a column for storing the day of the week
+
+```{r}
+
+weekdays <- factor(c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"),
+                   levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+
+data$weekday <- weekdays[wday(as.POSIXct(data$started_at))]
+
+```
+
+With bins = 60, each bin represent one minute additional to the ride. We
+can see that people in NYC most likely rent a bike to use for 4-7
+minutes. Let's conduct t-test to see if memebership type has any effect
+on renting duration
+
+```{r}
+summary(data)
+```
+
+### Data Cleaning
+
+The statistical summary shows that the data has outliers. We need to
+take care them first before proceeding to the analysis
+
+```{r}
+boxplot(data$end_lng)
+boxplot(data$end_lat)
+```
+
+```{r}
+count(data |> filter(end_lat == 0))
+count(data |> filter(end_lng == 0))
+```
+
+The end lat and end_lon contains coordinations that are 0. Since there
+are only 15 entries looking like that, we are going to remove all of
+them.
+
+### Outliers in duration
+
+As showing in the histogram of duration above, there are a lot of
+outliers in the dataset for duration. My method is to label the
+observations with duration is longer than 1.5 \* InterQuartile Range
+from Q3.
+
+```{r}
+#Calculate the outlier initial value
+
+duration_quantiles <- quantile(data$duration, probs=c(.25, .5, .75), type=1)
+
+iqr <- duration_quantiles[3] - duration_quantiles[1]
+
+duration_outlier_val <- duration_quantiles[3] + 0.25 * iqr
+
+# Filter values
+
+prop_true <- sum(data$duration >= duration_outlier_val) / nrow(data)
+
+cat("Proportion of TRUE:", prop_true, "\n")
+```
+
+Since there are only 0.055 of the data contains outliers rides, we
+discard those outliers to clean up the dataset.
+
+```{r}
+data <- data |> filter(data$duration < duration_outlier_val)
+```
+
+```{r}
+hist(data$duration)
+```
+
+```{r}
+boxplot(data$duration)
+```
+
+Here I add extract and add a column of the start time (in hour)
+
+```{r}
+convert_hour <- function(time) {
+  hour <- as.numeric(format(time, "%H"))
+  minute <- as.numeric(format(time, "%M"))
+  
+  return(hour + minute/60) 
+}
+
+data$start_time <- sapply(data$started_at, convert_hour)
+```
+
+# Subquestion 1: Do trips taken by subscribers differ in duration compared to trips taken by casual users?
+
+```{r}
+member_duration <- data[data$member_casual == 'member',]$duration
+casual_duration <- data[data$member_casual == 'casual',]$duration
+```
+
+For this question, I want to perform t-test to test to confirm if the
+trip duration of rides taken by members differ from rides taken by
+casual drivers.
+
+Null Hypothesis: the mean of ride duration for member drivers and casual
+drivers are not different
+
+Alternative Hypothesis: there is difference in the mean of ride duration
+for member and casual drivers
+
+## Assumption check
+
+### Normality
+
+```{r}
+for (membership in c('member', 'casual')){
+  
+  qqnorm(data[data$member_casual == membership,]$duration)
+  qqline(data[data$member_casual == membership,]$duration, col='blue')
+}
+```
+
+The qq plots suggest the data are heavy-tailed. However, we can see that
+the middle range of the sample quantile is close to the normal line.
+Plus, since the data size is very big, we can use Central Limit Theorem
+to conclude the distribution of the mean is normal.
+
+```{r}
+mean_and_variance <- function(data) {
+  nu <- mean(data, na.rm = TRUE)
+  variance <- var(data, na.rm = TRUE)
+  cat('Mean: ', nu, ' Variance: ', variance)
+}
+
+cat("Member's duration: ")
+mean_and_variance(member_duration)
+cat("\nCasual's duration: ")
+mean_and_variance(casual_duration)
+```
+
+So, we can conclude that member's duration and casual's duration satisfy
+the normality of mean assumption with the above mean and variance. Also,
+they potentially have different means, too.
+
+### Independence
+
+In this dataset, the data was collected individually from mostly all
+users in New York City, which may contain the two or more entries come
+from a person. However, the trip durations are not depended on each
+others since the data was randomly collected and the chance of one bike
+ride's duration influence another is very low as it go against the
+common sense. So, the observations are independent from each others.
+
+### t-test
+
+Now we have checked all the assumptions, let's proceed with 2 samples
+t-test.
+
+```{r}
+t.test(duration ~ member_casual, data=data)
+```
+
+First of all, t-test's p-value (\< 0.05) indicates that we have
+sufficient evidence to reject the null hypothesis. Hence, the average
+duration of bike rides of member and casual groups are different. With
+that being said, membership has influence on ride's duration.
+
+```{r}
+ggplot(data=data[data$duration < 60,], aes(x=duration, color=member_casual, group=member_casual)) + geom_histogram(bins = 60) + theme_classic() + labs(title='Histogram of ride duration under 60 minutes', x='Duration (mins)', y='Count', color='Membership')
+```
+
+```{r}
+ggplot(data=data[data$duration < 60,], aes(x=duration, fill=member_casual, group=member_casual)) + 
+  geom_boxplot(outlier.shape = NA) + labs(title='Box plot of ride duration between casual and member users', x='Duration (in minutes)', fill='Membership') + theme_classic()
+```
+
+In particular, casual users tend to use the bike for longer duration
+than member drivers. This trend makes sense as people who subscribes to
+the membership plan usually commute regularly using bike (bike service
+from this program, specifically). If they commute regularly, it is more
+likely that the range of the trip is short so that they can save time to
+find parking or money on gas. For long trips, it is more likely that the
+bikes are used in emergency cases rather than regular commute. Also,
+maybe they just want to try out the service. As a result, this insight
+explain why membership affect the bike duration. Last but not least,
+membership should be included in our linear regression model for
+duration.
+
+# Subquestion 2: What is the effect of bike type (electric vs. classic) on the trip duration, controlling for the day of the week?
+
+E-bikes offer an effortless ride with the help of motors, while classic
+bikes require riders to use their pure strengths to move the bike. In
+New York City, the streets are often crowded, and bicycles have become a
+popular means of transportation for many residents, especially for
+commuting to work (NYC Department of Transportation, 2022). Due to the
+convenience, e-bikes’ rates are significantly higher than that of
+classic bikes. So, it is interesting to see how the ride duration is for
+each type of ride with the consideration of the day of the week. This
+finding will tell about the economic effectiveness of electric bikes
+compared to classic bikes.
+
+```{r}
+data |> group_by(rideable_type, weekday) |> summarise(count = n())
+```
+
+In all the groups, the number of entries are all very large. Hence, we
+can use CLT to confirm that the mean distribution of duration among all
+groups are normal. Between classic bike and e-bike, the ride duration of
+one cannot influence the other as there are no relationship between
+them. However, as we seen in the plot of usage timeseries, we can see
+that there are seasonality with weekly frequency in the data. So, if we
+group the data into day of the week (Monday, Tuesday, etc.), there is a
+potential that the data are not dependent. Thus, the setting must be
+comparing e-bike and classic bike groups 7 times corresponding to 7 days
+a week.
+
+Null hypothesis: There are no different in trip's average duration
+between ride type - weekday groups Alternative hypothesis: There exist a
+ride type - weekday group that has difference trip's average duration
+compare to others
+
+```{r}
+results <- list()
+
+# Loop through each weekday
+for (day in weekdays) {
+  # Filter the data for the current day
+  tmp <- data[data$weekday == day, ]
+  
+  # Run t-test
+  test <- t.test(duration ~ rideable_type, data = tmp)
+  
+  # Save the summary of the t-test in the results list
+  results[[day]] <- test
+}
+
+print(results)
+```
+
+Among all the test results, the p-value are always less than 0.05
+suggesting that we can reject the null hypothesis and conclude that the
+trip's average duration between classic bike and electric bike are
+diffrent controlling by day of the week. Furthermore, the mean of ride
+duration of e-bikes is always higher than classic bikes. Hence, it means
+that the e-bike is mainly picked if people want to go for a long ride
+while classic bikes are more suitable to short rides. Let's plot them
+all on a plot to identify the weekly trend.
+
+```{r}
+ggplot(data = data, aes(x=weekday, y=duration, colour = rideable_type)) + geom_boxplot(outlier.shape = NA) + labs(title='Box plot of ride duration between casual and member users', x='Duration (in minutes)', fill='Ride type') + theme_classic()
+```
+
+Averagely, the duration of rides of both classic bikes and e-bikes peak
+during weekend days. This can be explained because people who want to
+use the bikes as a way to enjoy the fresh air or exercise after a busy
+week contribute to the surge of demand. As a result, Citi Bike should
+have a routine distribution of bike, meaning that they should store
+bikes in warehouse during the week and release them fully during the
+weekend to minimize the chance of bikes become damaged due to frequent
+usages. Also, we can conclude that rideable type and day of the week are
+significant predictor for the duration linear regression model.
+
+# Subquestion 3: How does ride duration differ at different starting locations?
+
+For this question, I want to check which region tend to have longer
+rides compare to others at different time a day, in other words, the
+ranking of demand at different regions. Knowing this will help decision
+makers gain more insights on where to ship newly charged bikes or
+schedule more frequent maintenance to meet the demand.
+
+First, I created the regions using grouping. I will focus on 5 different
+regions: Downtown Manhattan, Central Park, Uptown New York + The Bronx,
+Brooklyn, and Queens. Those are the areas that represented in the
+dataset. The New York main island part was separated into 3 parts to
+increase classification accuracy as it is very wide and dense.
+
+Due to the size of the data set, it will take a lot of time to use API
+to map the start stations coordination to the exact region. So, I
+created 5 central coordinates corresponding to 5 big areas and performed
+clustering using Euclidean distance. In the plot, we can see that there
+are some mismatch in Brooklyn. It is because of the points that we used
+as the center. However, the grouping shows the distinction between the
+areas so we are good to go.
+
+```{r}
+library(tidygeocoder)
+
+
+locations <- data[, c('start_lat', 'start_lng')]
+
+find_nearest_region <- function(lat, lon, regions) {
+  # Calculate great-circle distances using the Haversine formula
+  distances <- sqrt((regions$lat - lat)^2 + (regions$lng - lon)^2)
+  
+  # Find the region with the minimum distance
+  nearest_region <- regions[which.min(distances), ]
+  
+  # Return the nearest region's name
+  return(nearest_region$region)
+}
+
+# Example usage
+regions <- data.frame(
+  region = c(
+    "Downtown Manhattan", 
+    "Brooklyn Downtown", 
+    "NY Uptown + The Bronx", 
+    "Central Park",
+    "Queens (Long Island City)"
+  ),
+  lat = c(
+    40.732724,  # Downtown Manhattan
+    40.689089,  # Brooklyn Downtown
+    40.820514,  # The Bronx
+    40.778834, # Central Park
+    40.762762  # Queens (Long Island City)
+  ),
+  lng = c(
+    -73.991779, # Downtown Manhattan
+    -73.957245, # Brooklyn Downtown
+    -73.935164, # The Bronx
+    -73.973304, # Central Park
+    -73.920252 # Queens (Long Island City)
+  )
+)
+
+locations$regions <- mapply(find_nearest_region, locations$start_lat, locations$start_lng, MoreArgs = list(regions))
+```
+
+```{r}
+data$start_region <- locations$regions
+
+plot_dat <- locations |> 
+  distinct(start_lat, start_lng, regions) |> 
+  st_as_sf(coords = c("start_lng", "start_lat"), crs = 4326)
+
+mapview(plot_dat, cex = 3, label = "regions", zcol = "regions", col.regions = c("blue", "green", "yellow", "red", "orange"))
+
+```
+
+### Assumption check
+
+The plan is to use ANOVA 5 times to compare the average ride duration at
+5 regions. Since, the ride duration of one region will not influence the
+usage at others, we can safely assume the independence assumption is
+satisfied. Since the data size is large, we can use Central Limit
+Theorem to conclude that the distribution of average duration in all the
+5 regions are normal.Now, we will create the usage data and check
+normality
+
+```{r}
+cat('Mean and variance of different regions:\n')
+for (region in regions$region) {
+  plot_data <-  data %>% filter(start_region == region) %>% drop_na() 
+  plot_data <- plot_data$duration
+  cat(region, ': ')
+  mean_and_variance(plot_data)
+  cat('\n')
+}
+
+```
+
+Next up, we can see that there is potential different in the means of
+all 5 groups. Plus. the variance of all groups are very close to each
+other. Hence, the data passed the potential mean different and
+homogeneity assumption
+
+So, the data already passed all the assumptions, we will proceed with
+the ANOVA analysis:
+
+### ANOVA
+
+Alpha = 0.05
+
+Null hypothesis (H0): The mean of duration at all 5 regions are similar
+to each other Alternative hypothesis (HA): There is at least one region
+that has average ride duration different from other regions.
+
+```{r}
+model <- aov(duration ~ start_region, data=data)
+summary(model)
+```
+
+Since ANOVA result in p-value \< 0.05, we have sufficient evidence to
+reject the null hypothesis and conclude that there is at least one
+region that has average ride duration different from other regions. In
+addition, I will perform Tukey's post hoc test to identify the
+differences between groups in pair.
+
+```{r, echo=TRUE, fig.width=9}
+TukeyHSD(model, conf.level = 0.95)
+```
+
+The result of Tukey told us that all the groups are distinct using
+p-value. For the Queens - NY Uptown + The Bronx pair, since p-value is
+not under 0.05, we conclude that the 2 groups are not different in term
+of ride duration. This result means the average duration of rides taken
+in 5 major areas of New York City are different. Let's corporate
+boxplots to compare the groups to give the ranking of average duration
+
+```{r}
+# Create the plot
+ggplot(data, aes(x = start_region, y = duration)) +
+  geom_boxplot() +
+  labs(title = "Boxplot of Duration by Start Region", 
+       x = "Start Region", y = "Duration") +
+  theme_classic()
+
+# Adjust the plot size when saving
+#ggsave=("boxplot.png", plot = p, width = 20, height = 6, units = "in")
+```
+
+Based on all the results, we can see that the average ride duration in
+Central Park is longest. Runner up is Brooklyn Downtown then Downtown
+Manhattan. And the final place are both NY Uptown + The Bronx and
+Queens. Using this insight, we can conclude two things:
+
+-   As the result from sub-question 2, Citi Bike should arrange the most
+    e-bikes in Central Park and promote their use, as customers there
+    are more likely to go for long trips and find them more appealing,
+    while reducing the number of classic bikes. The classic bikes should
+    be put at Queens and NY Uptowns + The Bronx areas because of the low
+    average duration. For short rides, it is more likely that people use
+    it for short commute or exercise. Hence, classic bikes will be more
+    practical for users in those 2 regions
+
+-   To improve customer satisfaction, Citi Bike can focus the
+    maintenance team into servicing the bikes in areas with high average
+    ride duration as the bikes there will more likely to travel at long
+    distance so it will more likely to have issues than in regions with
+    low average ride duration.
+
+In general, region of start_station is a significant predictor for
+duration in our linear regression model.
+
+# Main question: What factors significantly influence the duration of Citi Bike trips in New York City Central Park?
+
+At first, I wanted to do the whole city scaled, but it is tedious to
+diagnose the linear model with such large dataset. Hence, I will focus
+the most on the Central Park region as this is a unique location where
+bikes can be used for various purposes (commuting, exercising, etc.). We
+can possibly see the effect of weekday and start time here using the
+variability in purpose of bike use.
+
+```{r}
+data$start_lat <- scale(data$start_lat, scale = FALSE)
+data$start_lng <- scale(data$start_lng, scale = FALSE)
+
+data |> group_by(start_region) |> summarise(count = n())
+tmp <- data[(data$start_region == 'Central Park'),]
+tmp
+```
+
+Firstly, as stated before, since the data was collected using random
+sampling as each ride does not relate to each other. So, we can safely
+confirm the data is independence.
+
+So, let's begin with assumption checking by first fitting the model
+
+```{r}
+model <- lm(log(duration) ~ member_casual + (start_lat : start_lng) + rideable_type * (start_time * weekday) , data=tmp)
+plot(model)
+```
+
+```{r}
+ggplot(data = data.frame(fitted = fitted(model), residuals = residuals(model)),
+       aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.3) + 
+  geom_hline(yintercept = 0, color = "red") +
+  labs(x = "Fitted Values", y = "Residuals", title="Residual Plot")
+```
+
+For the residual, I used log transformation to reduce the skewness of
+duration. If we look at the QQ-plot, the upper part turn away from the
+qq line, which shows that there is heavy skewness in one side of the
+errors. In contrast, the lower part align very close to the normal line.
+We cannot use CLT here as it only applies to the sample mean not the
+individual data points. So, using this result we can say the residuals
+are not completely normally distributed. Also, this means that the model
+can be over-performed comparing to using the original duration data.
+Moreover, the prediction will change to log-scaled duration. If the
+model perform well, we need to perform e$^x$ transformation to get the
+exact value for duration.
+
+By applying dim on points in the residual plot with low appearances (low
+alpha on a point, so points with more appearances will be darker), we
+see that there is no general pattern. The scatter points cluster around
+-0.5 for major of the fitted values. Thus, we can conclude that the
+error has constant variance This indicates that there is some
+correlation between at least one predictor and the dependent variable.
+However, since the shape of the residual plot is not a horizontal band,
+the linearity assumption between duration and the predictors is not
+satisfied.
+
+In the residual vs leverage plot, we don't see any observations out side
+any red dashed line, hence, there are not any influential points in the
+dataset.
+
+In general, the assumptions for the linear regression as almost
+satisfied except the linearity and normality of residuals. So, the
+result may not be correct.
+
+### Regression Model Result
+
+```{r}
+summary(model)
+```
+
+```{r}
+print(paste('MSE:', round(mean(residuals(model)^2), 3)))
+
+mod_fits <- fitted(model)
+my_df <- data.frame(actual = tmp$duration, fitted = mod_fits)
+ggplot(my_df, aes(x = fitted, y = actual)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, col = "red") + 
+  theme_bw(base_size = 15) +
+  labs(x = "Fitted values", y = "Actual values", title = "Actual vs. Fitted") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Formula:
+
+To create the linear regression model for the duration at stations in
+Central Park region, I used membership, start location coordinate and
+start time (in hour), day of the week, and ride type. Since we did not
+investigate the relationship between membership and other variables, I
+let it be the standalone predictor (no interaction). The same applied
+for start station coordinate as we have not investigated its
+relationship with weekday or start time. Hence I did not include the
+interaction for this variable. For ride type, we saw that it varied
+among day of the week. So, we will include that interaction and improve
+the detail by including ride type interaction with start time in the
+formula to represent the purposes of bike usage. In general, our formula
+is:
+
+`log(duration) ~ member_casual + (start_lat : start_lng) + rideable_type * start_time * weekday`
+
+Noted that I have performed grid search by trying different combinations
+of all the variables and using F-statistics to indicate the good of
+fitment, Mean adjusted R-squared (R2) and Mean Squared Error (MSE) to
+indicate the accuracy. The above formula is the best one. Noted that
+although high F-statistics is good, we have to beware of extremely high
+values as it indicates that the model is over-fit if R2 is low and MSE
+is high. Moreover, I also performed mean centering to the start
+coordinate of start station for better interpretation. This means that
+the intercept will account for cases where the station is in the center
+of the Central Park region cluster. Then the other station will be
+represented by the coordinate different from the center (not distance).
+
+#### Model fitment:
+
+First of all, F-statistics of 290.7 with p-value \< 0.05 shows that this
+model is well-fitted. The MSE of 0.391 is relatively small comparing to
+the range of values (1-3), however, it is not good enough. Those 2
+metrics show that the model is balanced in terms of error and prediction
+accuracy, which mean it may not be over-fit or under-fit. Looking at
+adjusted-R2, we can see that the value is around 0.024. It means that
+this multivariate linear regression model can only explain 2.4% of
+log-transformed duration. This is extremely bad already. If we apply
+$e^x$ transformation to revert to original scale, the performance get
+worse. Hence, this model is not suitable to predict the ride duration of
+stations in Central Park region.
+
+#### Conclusion and future questions
+
+By checking all the evaluation metric, we see that the model cannot
+represent the characteristic of ride duration in Central Park region.
+Moreover, not all the assumptions are met. Hence, the coefficients and
+p-value of all the predictors are not correct. Hence, we cannot identify
+the most influential factor to ride duration using this approach.
+However, it is possible to model the ride duration as the results from
+the three sub-questions show that the difference in ride types,
+membership, weekday, and start station location can result in different
+values of ride duration. Hence, we can use other approaches such as
+analyzing and comparing feature importance from Decision Tree based
+algorithms to answer this question. Moreover, we can also use other
+Machine Learning algorithms create a predictive model for ride duration.
+This model will be very helpful for Citi Bike decision makers to assess
+and decide "which station should be upgraded to meet the demand of
+customer?", or "where should the new station locate?". Also, we can
+perform analysis on the year-scaled data to analyze the usage of
+stations and corporate that information to the above analysis to
+integrate more in-depth information to better answer those questions.
+
+About the dataset, since this is a big data problem, my machine cannot
+handle it properly so I had to limit the range of data to only half a
+month. Different results might appear if we analyze those questions
+again on the data that capture a wider time-span. It will require big
+data capable tools like Spark and a stronger machine to handle.
+
+In conclusion, we found out that:
+
+-   People who subscribes to the Citi Bike membership tends to have make
+    shorter rides compare to people who do not.
+
+-   E-bikes is more preferred for longer trips and classic bikes is the
+    most popular choice for short trips.
+
+-   The ride duration varies at different regions in New York City.
+
+Using the above findings, decision makers can change the operation to
+better serve the customers and reduce the chance of damaging the
+vehicles by having a better distribution plan.
